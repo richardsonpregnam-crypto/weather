@@ -19,10 +19,41 @@ function send(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+const CACHE_TTL_MS = 60 * 1000;
+const jsonCache = new Map();
+const inFlight = new Map();
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
 async function fetchJSON(url, options = {}) {
-  const r = await fetch(url, { ...options, headers: { 'User-Agent': 'WeatherIQ-Hackathon/2.0' } });
-  if (!r.ok) throw new Error(`Upstream service returned ${r.status}`);
-  return r.json();
+  const now = Date.now();
+  const cached = jsonCache.get(url);
+  if (cached && cached.expires > now) return cached.data;
+  if (inFlight.has(url)) return inFlight.get(url);
+
+  const request = (async () => {
+    let lastStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await fetch(url, {
+        ...options,
+        headers: { 'User-Agent': 'WeatherIQ-Hackathon/3.0', ...(options.headers || {}) }
+      });
+      lastStatus = r.status;
+      if (r.ok) {
+        const data = await r.json();
+        jsonCache.set(url, { data, expires: Date.now() + CACHE_TTL_MS });
+        return data;
+      }
+      if (r.status !== 429 && r.status < 500) break;
+      const retryAfter = Number(r.headers.get('retry-after') || 0);
+      await sleep(retryAfter > 0 ? Math.min(retryAfter * 1000, 5000) : 500 * (attempt + 1));
+    }
+    throw new Error(`Upstream service returned ${lastStatus}`);
+  })();
+
+  inFlight.set(url, request);
+  try { return await request; }
+  finally { inFlight.delete(url); }
 }
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -81,9 +112,23 @@ async function officialImdFeed() {
 
 async function mapPoints(lat, lon) {
   const offsets = [[0,0],[0.7,0.6],[-0.7,0.8],[0.5,-0.9],[-0.8,-0.6],[1.0,-0.2],[-1.0,0.2]];
-  return Promise.all(offsets.map(async ([a,b]) => {
-    const d = await getWeather(lat + a, lon + b);
-    return { lat: lat+a, lon: lon+b, temp: d.current.temperature_2m, wind: d.current.wind_speed_10m, rain: d.current.precipitation, humidity: d.current.relative_humidity_2m, code: d.current.weather_code };
+  const lats = offsets.map(([a]) => lat + a);
+  const lons = offsets.map(([,b]) => lon + b);
+  const p = new URLSearchParams({
+    latitude: lats.join(','),
+    longitude: lons.join(','),
+    timezone: 'auto',
+    current: 'temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m'
+  });
+  const result = await fetchJSON(`https://api.open-meteo.com/v1/forecast?${p}`);
+  const rows = Array.isArray(result) ? result : [result];
+  return rows.map((d, i) => ({
+    lat: lats[i], lon: lons[i],
+    temp: d.current?.temperature_2m,
+    wind: d.current?.wind_speed_10m,
+    rain: d.current?.precipitation,
+    humidity: d.current?.relative_humidity_2m,
+    code: d.current?.weather_code
   }));
 }
 
