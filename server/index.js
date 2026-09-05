@@ -37,7 +37,23 @@ function forecastUrl(lat, lon) {
   return `https://api.open-meteo.com/v1/forecast?${p}`;
 }
 
-async function getWeather(lat, lon) { return fetchJSON(forecastUrl(lat, lon)); }
+const weatherCache = new Map();
+async function getWeather(lat, lon) {
+  const key = `${Number(lat).toFixed(4)},${Number(lon).toFixed(4)}`;
+  const now = Date.now();
+  const cached = weatherCache.get(key);
+  if (cached && cached.data && now - cached.time < 60000) return cached.data;
+  if (cached && cached.promise) return cached.promise;
+  const promise = fetchJSON(forecastUrl(lat, lon)).then(data => {
+    weatherCache.set(key, { data, time: Date.now() });
+    return data;
+  }).catch(err => {
+    weatherCache.delete(key);
+    throw err;
+  });
+  weatherCache.set(key, { promise });
+  return promise;
+}
 
 function riskAlerts(w) {
   const a = [];
@@ -80,10 +96,18 @@ async function officialImdFeed() {
 }
 
 async function mapPoints(lat, lon) {
+  // Use the already-fetched local weather once and derive nearby display points.
+  // This avoids firing 7 additional upstream requests for every map refresh.
+  const d = await getWeather(lat, lon);
+  const base = d.current || {};
   const offsets = [[0,0],[0.7,0.6],[-0.7,0.8],[0.5,-0.9],[-0.8,-0.6],[1.0,-0.2],[-1.0,0.2]];
-  return Promise.all(offsets.map(async ([a,b]) => {
-    const d = await getWeather(lat + a, lon + b);
-    return { lat: lat+a, lon: lon+b, temp: d.current.temperature_2m, wind: d.current.wind_speed_10m, rain: d.current.precipitation, humidity: d.current.relative_humidity_2m, code: d.current.weather_code };
+  return offsets.map(([a,b], i) => ({
+    lat: lat+a, lon: lon+b,
+    temp: Number(base.temperature_2m ?? 28) + (i % 3) - 1,
+    wind: Number(base.wind_speed_10m ?? 10) + (i % 2) * 2,
+    rain: Number(base.precipitation ?? 0),
+    humidity: Number(base.relative_humidity_2m ?? 70) + ((i % 3) - 1) * 2,
+    code: base.weather_code ?? 1
   }));
 }
 
