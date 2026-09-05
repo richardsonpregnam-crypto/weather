@@ -19,10 +19,46 @@ function send(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+const cache = new Map();
+const CACHE_TTL_MS = 60 * 1000;
+const inflight = new Map();
+
 async function fetchJSON(url, options = {}) {
-  const r = await fetch(url, { ...options, headers: { 'User-Agent': 'WeatherIQ-Hackathon/2.0' } });
-  if (!r.ok) throw new Error(`Upstream service returned ${r.status}`);
-  return r.json();
+  const cached = cache.get(url);
+  if (cached && Date.now() - cached.time < CACHE_TTL_MS) return cached.data;
+  if (inflight.has(url)) return inflight.get(url);
+
+  const request = (async () => {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await fetch(url, {
+          ...options,
+          headers: {
+            'User-Agent': 'WeatherIQ-Hackathon/3.0',
+            ...(options.headers || {})
+          }
+        });
+        if (r.status === 429) {
+          const wait = Math.min(4000, 1000 * (attempt + 1));
+          await new Promise(resolve => setTimeout(resolve, wait));
+          lastError = new Error('Upstream service returned 429');
+          continue;
+        }
+        if (!r.ok) throw new Error(`Upstream service returned ${r.status}`);
+        const data = await r.json();
+        cache.set(url, { time: Date.now(), data });
+        return data;
+      } catch (e) {
+        lastError = e;
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
+    throw lastError || new Error('Upstream service unavailable');
+  })().finally(() => inflight.delete(url));
+
+  inflight.set(url, request);
+  return request;
 }
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -37,23 +73,7 @@ function forecastUrl(lat, lon) {
   return `https://api.open-meteo.com/v1/forecast?${p}`;
 }
 
-const weatherCache = new Map();
-async function getWeather(lat, lon) {
-  const key = `${Number(lat).toFixed(4)},${Number(lon).toFixed(4)}`;
-  const now = Date.now();
-  const cached = weatherCache.get(key);
-  if (cached && cached.data && now - cached.time < 60000) return cached.data;
-  if (cached && cached.promise) return cached.promise;
-  const promise = fetchJSON(forecastUrl(lat, lon)).then(data => {
-    weatherCache.set(key, { data, time: Date.now() });
-    return data;
-  }).catch(err => {
-    weatherCache.delete(key);
-    throw err;
-  });
-  weatherCache.set(key, { promise });
-  return promise;
-}
+async function getWeather(lat, lon) { return fetchJSON(forecastUrl(lat, lon)); }
 
 function riskAlerts(w) {
   const a = [];
@@ -96,19 +116,20 @@ async function officialImdFeed() {
 }
 
 async function mapPoints(lat, lon) {
-  // Use the already-fetched local weather once and derive nearby display points.
-  // This avoids firing 7 additional upstream requests for every map refresh.
-  const d = await getWeather(lat, lon);
-  const base = d.current || {};
   const offsets = [[0,0],[0.7,0.6],[-0.7,0.8],[0.5,-0.9],[-0.8,-0.6],[1.0,-0.2],[-1.0,0.2]];
-  return offsets.map(([a,b], i) => ({
-    lat: lat+a, lon: lon+b,
-    temp: Number(base.temperature_2m ?? 28) + (i % 3) - 1,
-    wind: Number(base.wind_speed_10m ?? 10) + (i % 2) * 2,
-    rain: Number(base.precipitation ?? 0),
-    humidity: Number(base.relative_humidity_2m ?? 70) + ((i % 3) - 1) * 2,
-    code: base.weather_code ?? 1
-  }));
+  const lats = offsets.map(([a]) => lat + a).join(',');
+  const lons = offsets.map(([,b]) => lon + b).join(',');
+  const p = new URLSearchParams({
+    latitude: lats, longitude: lons, timezone: 'auto', forecast_days: '1',
+    current: 'temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m'
+  });
+  const data = await fetchJSON(`https://api.open-meteo.com/v1/forecast?${p}`);
+  const rows = Array.isArray(data) ? data : [data];
+  return offsets.map(([a,b], i) => {
+    const d = rows[i] || {};
+    const c = d.current || {};
+    return { lat: lat+a, lon: lon+b, temp: c.temperature_2m, wind: c.wind_speed_10m, rain: c.precipitation, humidity: c.relative_humidity_2m, code: c.weather_code };
+  });
 }
 
 
