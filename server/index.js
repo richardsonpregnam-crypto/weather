@@ -1,7 +1,13 @@
 import http from 'node:http';
 import { URL } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PORT = process.env.PORT || 5000;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DIST_DIR = path.join(__dirname, '..', 'dist');
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
   'Access-Control-Allow-Origin': '*',
@@ -172,7 +178,7 @@ const server = http.createServer(async (req, res) => {
       return send(res,200,await verifyPost(body));
     }
     const lat = num(u.searchParams.get('lat')), lon = num(u.searchParams.get('lon'));
-    if (u.pathname !== '/api/health' && (!Number.isFinite(lat) || !Number.isFinite(lon))) return send(res,400,{error:'Valid lat and lon are required'});
+    if (u.pathname.startsWith('/api/') && u.pathname !== '/api/health' && (!Number.isFinite(lat) || !Number.isFinite(lon))) return send(res,400,{error:'Valid lat and lon are required'});
     if (u.pathname === '/api/weather') return send(res,200,await getWeather(lat,lon));
     if (u.pathname === '/api/alerts') { const w = await getWeather(lat,lon); const imd = await officialImdFeed(); return send(res,200,{ alerts:riskAlerts(w), official:imd }); }
     if (u.pathname === '/api/historical') return send(res,200,await historical(lat,lon));
@@ -182,7 +188,18 @@ const server = http.createServer(async (req, res) => {
       const p = new URLSearchParams({ latitude: lat, longitude: lon, language: 'en', format: 'json' });
       return send(res,200,await fetchJSON(`https://geocoding-api.open-meteo.com/v1/reverse?${p}`));
     }
-    return send(res,404,{error:'Not found'});
+
+    // Serve the production React build from the same Node service on Render.
+    const requestedPath = decodeURIComponent(u.pathname);
+    const safePath = path.normalize(requestedPath).replace(/^([.][.][/\\])+/, '');
+    let filePath = path.join(DIST_DIR, safePath);
+    if (requestedPath === '/' || !path.extname(requestedPath)) filePath = path.join(DIST_DIR, 'index.html');
+    if (!filePath.startsWith(DIST_DIR)) return send(res,403,{error:'Forbidden'});
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) filePath = path.join(DIST_DIR, 'index.html');
+    const ext = path.extname(filePath).toLowerCase();
+    const types = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp', '.ico':'image/x-icon', '.woff':'font/woff', '.woff2':'font/woff2' };
+    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
+    return res.end(fs.readFileSync(filePath));
   } catch (e) {
     console.error(e);
     send(res,502,{error:'Weather service unavailable',detail:e.message});
