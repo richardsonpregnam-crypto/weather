@@ -19,46 +19,10 @@ function send(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-const cache = new Map();
-const CACHE_TTL_MS = 60 * 1000;
-const inflight = new Map();
-
 async function fetchJSON(url, options = {}) {
-  const cached = cache.get(url);
-  if (cached && Date.now() - cached.time < CACHE_TTL_MS) return cached.data;
-  if (inflight.has(url)) return inflight.get(url);
-
-  const request = (async () => {
-    let lastError;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const r = await fetch(url, {
-          ...options,
-          headers: {
-            'User-Agent': 'WeatherIQ-Hackathon/3.0',
-            ...(options.headers || {})
-          }
-        });
-        if (r.status === 429) {
-          const wait = Math.min(4000, 1000 * (attempt + 1));
-          await new Promise(resolve => setTimeout(resolve, wait));
-          lastError = new Error('Upstream service returned 429');
-          continue;
-        }
-        if (!r.ok) throw new Error(`Upstream service returned ${r.status}`);
-        const data = await r.json();
-        cache.set(url, { time: Date.now(), data });
-        return data;
-      } catch (e) {
-        lastError = e;
-        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-      }
-    }
-    throw lastError || new Error('Upstream service unavailable');
-  })().finally(() => inflight.delete(url));
-
-  inflight.set(url, request);
-  return request;
+  const r = await fetch(url, { ...options, headers: { 'User-Agent': 'WeatherIQ-Hackathon/2.0' } });
+  if (!r.ok) throw new Error(`Upstream service returned ${r.status}`);
+  return r.json();
 }
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -117,19 +81,10 @@ async function officialImdFeed() {
 
 async function mapPoints(lat, lon) {
   const offsets = [[0,0],[0.7,0.6],[-0.7,0.8],[0.5,-0.9],[-0.8,-0.6],[1.0,-0.2],[-1.0,0.2]];
-  const lats = offsets.map(([a]) => lat + a).join(',');
-  const lons = offsets.map(([,b]) => lon + b).join(',');
-  const p = new URLSearchParams({
-    latitude: lats, longitude: lons, timezone: 'auto', forecast_days: '1',
-    current: 'temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m'
-  });
-  const data = await fetchJSON(`https://api.open-meteo.com/v1/forecast?${p}`);
-  const rows = Array.isArray(data) ? data : [data];
-  return offsets.map(([a,b], i) => {
-    const d = rows[i] || {};
-    const c = d.current || {};
-    return { lat: lat+a, lon: lon+b, temp: c.temperature_2m, wind: c.wind_speed_10m, rain: c.precipitation, humidity: c.relative_humidity_2m, code: c.weather_code };
-  });
+  return Promise.all(offsets.map(async ([a,b]) => {
+    const d = await getWeather(lat + a, lon + b);
+    return { lat: lat+a, lon: lon+b, temp: d.current.temperature_2m, wind: d.current.wind_speed_10m, rain: d.current.precipitation, humidity: d.current.relative_humidity_2m, code: d.current.weather_code };
+  }));
 }
 
 
